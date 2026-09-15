@@ -1,0 +1,5 @@
+.arg
+.env
+.venv
+config.json
+token_cache.json
