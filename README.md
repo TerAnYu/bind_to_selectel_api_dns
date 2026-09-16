@@ -34,13 +34,14 @@ mkdir bind_to_selectel_api_dns && cd bind_to_selectel_api_dns
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate  # Для Windows: .venv\Scripts\activate
+source .venv/bin/activate
+# Для Windows: .venv\Scripts\activate
 ```
 
 3. **Установите зависимости:**
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 ```
 
 ## ⚙️ Настройка
