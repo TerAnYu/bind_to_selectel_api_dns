@@ -1,4 +1,4 @@
-# SCRIPT_VERSION: 3.8
+# SCRIPT_VERSION: 3.9.6
 import requests
 import json
 import sys
@@ -11,6 +11,22 @@ TOKEN_CACHE_FILE = SCRIPT_DIR / "token_cache.json"
 
 AUTH_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
 BASE_DNS_API_URL = "https://api.selectel.ru/domains/v2"
+
+def to_punycode(domain: str) -> str:
+    if not domain:
+        return domain
+    try:
+        return domain.encode('idna').decode('ascii')
+    except (UnicodeError, AttributeError):
+        return domain
+
+def from_punycode(domain: str) -> str:
+    if not domain:
+        return domain
+    try:
+        return domain.encode('ascii').decode('idna')
+    except (UnicodeError, AttributeError):
+        return domain
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -53,7 +69,6 @@ def get_valid_token(config):
         return None
 
 def remove_comment(line):
-    """Удаляет комментарии (;), игнорируя точки с запятой внутри двойных кавычек."""
     in_quotes = False
     result = []
     for char in line:
@@ -65,41 +80,31 @@ def remove_comment(line):
     return "".join(result).strip()
 
 def parse_zone_file(filepath):
-    zone_name = Path(filepath).name
-    records_dict = {}
-    default_ttl = 3600
-    current_origin = zone_name + "." # Значение по умолчанию
+    fallback_zone_name = to_punycode(Path(filepath).name)
+    zone_name = fallback_zone_name
+    current_origin = zone_name + "."
     
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
         
     lines = [remove_comment(line) for line in content.split('\n')]
     
-    # 1. Обработка директив $ORIGIN и $TTL
-    processed_lines = []
     for line in lines:
         upper_line = line.upper().strip()
         if upper_line.startswith('$ORIGIN'):
             parts = line.split()
-            if len(parts) >= 2:
-                current_origin = parts[1]
-                if not current_origin.endswith('.'):
-                    current_origin += '.'
+            if len(parts) >= 2 and parts[1].strip() != '.':
+                zone_name = to_punycode(parts[1])
+                current_origin = zone_name if zone_name.endswith('.') else zone_name + "."
+                break
+
+    processed_lines = []
+    for line in lines:
+        upper_line = line.upper().strip()
+        if upper_line.startswith('$ORIGIN') or upper_line.startswith('$TTL') or upper_line.startswith('$'):
             continue
-        elif upper_line.startswith('$TTL'):
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    default_ttl = int(parts[1])
-                except ValueError:
-                    pass
-            continue
-        elif upper_line.startswith('$'):
-            continue # Игнорируем другие директивы ($INCLUDE и т.д.)
-            
         processed_lines.append(line)
         
-    # 2. Объединение многострочных записей
     joined_lines, current_line = [], ""
     for line in processed_lines:
         if '(' in line and ')' not in line:
@@ -111,6 +116,30 @@ def parse_zone_file(filepath):
                 current_line = ""
         else:
             joined_lines.append(line)
+            
+    if current_origin == "." or current_origin == fallback_zone_name + ".":
+        for line in joined_lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            try:
+                soa_idx = [t.upper() for t in tokens].index('SOA')
+                if soa_idx >= 2 and tokens[soa_idx-1].upper() == 'IN':
+                    candidate = tokens[soa_idx-2]
+                elif soa_idx >= 1:
+                    candidate = tokens[soa_idx-1]
+                else:
+                    candidate = "@"
+                
+                if candidate != "@":
+                    zone_name = to_punycode(candidate)
+                    current_origin = zone_name if zone_name.endswith('.') else zone_name + "."
+                break
+            except ValueError:
+                continue
+
+    records_dict = {}
+    default_ttl = 3600
             
     last_name = "@"
     for line in joined_lines:
@@ -133,26 +162,24 @@ def parse_zone_file(filepath):
                 
         if rec_type:
             content_val = " ".join(tokens[idx:])
-            
-            # 3. Очистка круглых скобок BIND (они нужны только для переноса строк)
             content_val = re.sub(r'\s*\(\s*', ' ', content_val)
             content_val = re.sub(r'\s*\)\s*', ' ', content_val)
-            content_val = " ".join(content_val.split()) # Нормализация пробелов
+            content_val = " ".join(content_val.split())
             
-            # 4. Формирование полного имени записи (FQDN)
             if name == "@":
                 api_name = current_origin
             elif name.endswith("."):
-                api_name = name
+                api_name = to_punycode(name)
             else:
-                api_name = f"{name}.{current_origin}"
+                api_name = to_punycode(f"{name}.{current_origin}")
                 
-            # 5. Специфичная обработка типов записей
             if rec_type == 'CNAME':
                 if content_val == "@":
                     content_val = current_origin
                 elif not content_val.endswith("."):
-                    content_val = f"{content_val}.{current_origin}"
+                    content_val = f"{to_punycode(content_val)}.{current_origin}"
+                else:
+                    content_val = to_punycode(content_val)
                     
             if rec_type == 'MX':
                 parts = content_val.split(maxsplit=1)
@@ -161,7 +188,9 @@ def parse_zone_file(filepath):
                     if target == "@":
                         target = current_origin
                     elif not target.endswith("."):
-                        target = f"{target}.{current_origin}"
+                        target = f"{to_punycode(target)}.{current_origin}"
+                    else:
+                        target = to_punycode(target)
                     content_val = f"{priority} {target}"
                     
             if rec_type == 'SRV':
@@ -171,16 +200,16 @@ def parse_zone_file(filepath):
                     if target == "@":
                         target = current_origin
                     elif not target.endswith("."):
-                        target = f"{target}.{current_origin}"
+                        target = f"{to_punycode(target)}.{current_origin}"
+                    else:
+                        target = to_punycode(target)
                     content_val = f"{priority} {weight} {port} {target}"
             
-            # ИСПРАВЛЕНО: Автоматическое добавление кавычек для TXT записей, если их нет
             if rec_type == 'TXT':
                 content_val = content_val.strip()
                 if not content_val.startswith('"'):
                     content_val = f'"{content_val}"'
                 elif not content_val.endswith('"'):
-                    # На случай опечатки в BIND-файле (начинается с ", но не заканчивается)
                     content_val = f'{content_val}"'
             
             key = (api_name, rec_type)
@@ -202,7 +231,8 @@ def get_existing_rrsets(zone_id, token):
     if resp.status_code == 200:
         rrsets = {}
         for item in resp.json().get("result", []):
-            key = (item["name"], item["type"])
+            # ИСПРАВЛЕНО: конвертируем имя записи из API в Punycode для корректного сравнения
+            key = (to_punycode(item["name"]), item["type"])
             rrsets[key] = {
                 "id": item["id"],
                 "ttl": item["ttl"],
@@ -214,26 +244,51 @@ def get_existing_rrsets(zone_id, token):
 def get_or_create_zone(zone_name, token):
     headers = {"X-Auth-Token": token, "Content-Type": "application/json"}
     api_zone_name = zone_name if zone_name.endswith('.') else zone_name + '.'
+    
     resp = requests.post(f"{BASE_DNS_API_URL}/zones", json={"name": api_zone_name}, headers=headers)
     if resp.status_code in [200, 201]:
         return resp.json()["id"], True
+        
     if resp.status_code == 409:
-        for z in requests.get(f"{BASE_DNS_API_URL}/zones", headers=headers, params={"filter": api_zone_name}).json().get("result", []):
-            if z["name"] == api_zone_name:
-                return z["id"], False
-    print(f"   ❌ Ошибка зоны: {resp.status_code} {resp.text}")
+        print(f"   ⚠️ Зона уже существует, пытаемся получить её ID...")
+        resp_list = requests.get(f"{BASE_DNS_API_URL}/zones", headers=headers, params={"limit": 1000})
+        
+        if resp_list.status_code == 200:
+            target_name_normalized = zone_name.rstrip('.').lower()
+            zones = resp_list.json().get("result", [])
+            
+            for z in zones:
+                z_name_normalized = to_punycode(z["name"]).rstrip('.').lower()
+                
+                if z_name_normalized == target_name_normalized:
+                    print(f"   ✅ Найдена существующая зона: {z['name']} (ID: {z['id']})")
+                    return z["id"], False
+            
+            print(f"   ❌ Не удалось найти зону '{target_name_normalized}' в списке зон аккаунта.")
+            print(f"   🔍 Для отладки, первые 5 зон в вашем аккаунте: {[z['name'] for z in zones[:5]]}")
+        else:
+            print(f"   ❌ Ошибка при получении списка зон: {resp_list.status_code} {resp_list.text}")
+            
+    print(f"   ❌ Критическая ошибка зоны: {resp.status_code} {resp.text}")
     return None, False
 
 def process_zone_file(filepath, token, config):
     print(f"\n{'='*50}\n📂 Обработка: {filepath}")
     zone_name, records = parse_zone_file(filepath)
-    print(f"   📝 Найдено уникальных RRSet-ов: {len(records)}")
+    
+    zone_unicode = from_punycode(zone_name.rstrip('.'))
+    if zone_unicode == zone_name.rstrip('.'):
+        print(f"   📝 Найдено уникальных RRSet-ов: {len(records)} (Зона: {zone_name})")
+    else:
+        print(f"    Найдено уникальных RRSet-ов: {len(records)} (Определённая зона: {zone_unicode}, конвертируем в Punycode: {zone_name})")
+    
     if not records:
         return 0, 0, 0
 
     zone_id, is_new = get_or_create_zone(zone_name, token)
     if not zone_id:
         return 0, 0, len(records)
+        
     print(f"   ✅ Зона '{zone_name}' {'создана' if is_new else 'уже существовала'} (ID: {zone_id})")
 
     existing = get_existing_rrsets(zone_id, token)
@@ -292,7 +347,7 @@ def process_zone_file(filepath, token, config):
                 print(f"      ℹ️  (уже существует в Selectel, пропущено)")
                 skipped += 1
             else:
-                print(f"      ❌ Ошибка создания: {resp.status_code} {resp.text}")
+                print(f"       Ошибка создания: {resp.status_code} {resp.text}")
                 errors += 1
 
     print(f"   📊 Итог: Создано/совпало: {success}, Пропущено: {skipped}, Ошибок: {errors}")

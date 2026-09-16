@@ -1,5 +1,11 @@
 .arg
 .env
 .venv
+env/
+__pycache__/
+*.pyc
+# OS files
+.DS_Store
+Thumbs.db
 config.json
 token_cache.json
